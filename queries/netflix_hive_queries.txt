@@ -1,0 +1,448 @@
+
+movie_titles(mid:integer, yearOfRelease:integer, title:varchar)
+
+movie_ratings(mid:integer, custormer_id:integer, date:varchar, rating: integer)
+
+hive> describe movie_ratings;                                         
+OK
+mid                 	int                 	None                
+customer_id         	int                 	None                
+date                	string              	None                
+rating              	int                 	None      
+
+hive> describe movie_titles;                                                                   
+OK
+mid                 	int                 	None                
+yearofrelease       	int                 	None                
+title               	string              	None                
+
+mid : movie_id
+
+
+Following analysis can be done on this data set :
+
+1)Movie Recommendation system based on ratings of simlar users
+2)Top 10 movies of the year
+3)Top 10 Movies in a given time frame
+4)List all the movies in a given timeframe
+5)List of movies Grouped by user rating
+
+-------------------------------------------------------------------------------------------------------------------------
+drop table if exists movie_titles;
+
+create table movie_titles (mid INT, yearOfRelease INT, title STRING)
+row format delimited
+fields terminated by ',';
+
+load data local inpath '/home/soumitra/Project2/dataset/movie_titles.csv'
+overwrite into table movie_titles;
+
+drop table if exists movie_ratings;
+
+create table movie_ratings(mid int, customer_id int,rating int, date string)
+row format delimited
+fields terminated by ',';
+
+load data local inpath '/home/soumitra/Project2/dataset/movie_ratings.csv' 
+overwrite into table movie_ratings; 
+
+drop table if exists netflix_movie_all;
+
+create table netflix_movie_all                                              
+    ROW FORMAT SERDE "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"
+    STORED AS RCFile
+    AS
+    select movie_titles.mid ,movie_titles.title , movie_titles.yearofrelease, movie_ratings.customer_id , movie_ratings.date , movie_ratings.rating from movie_titles join movie_ratings
+    on (movie_titles.mid = movie_ratings.mid);
+
+drop table if exists j_data_all;
+    
+create table j_data_all
+row format serde "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"
+stored as rcfile
+as
+select * from netflix_movie_all where rating >3;
+
+drop table if exists jacarrd_init0;
+
+create table jacarrd_init0
+row format serde "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"
+stored as rcfile
+as
+select a.customer_id as cust_c1,a.mid from movie_ratings a where a.customer_id = '33'
+and rating > 3;
+
+drop table if exists jacarrd_init1;
+
+create table jacarrd_init1
+row format serde "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"
+stored as rcfile
+as
+select a.cust_c1,b.customer_id as cust_c2 , a.mid as mid_c2 from movie_ratings b join jacarrd_init0 a on (b.mid = a.mid ) 
+where b.rating >3 and b.customer_id <> a.cust_c1;
+
+drop table if exists jacarrd_m11;
+
+create table jacarrd_m11
+row format serde "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"
+stored as rcfile
+as
+select a.cust_c1,a.cust_c2,count(*) as m11 from jacarrd_init1 a
+group by a.cust_c1,a.cust_c2;
+
+drop table if exists j_cust_movie_count;
+
+create table j_cust_movie_count
+row format serde "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"
+stored as rcfile
+as
+select customer_id , count(1) as total from movie_ratings where rating > 3 group by customer_id;
+
+drop table if exists jacarrd_movie_count_c1;
+
+create table jacarrd_movie_count_c1
+row format serde "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"
+stored as rcfile
+as
+select a.*,b.total as total_movie_count_C1 from jacarrd_m11 a join j_cust_movie_count b on (a.cust_c1 = b.customer_id ) ;
+
+drop table if exists jacarrd_movie_count_c2;
+
+create table jacarrd_movie_count_c2
+row format serde "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"
+stored as rcfile
+as
+select a.*,b.total as total_movie_count_C2 from jacarrd_movie_count_c1 a join j_cust_movie_count b on (a.cust_c2 = b.customer_id ) ;
+
+drop table if exists jacarrd_total_m_count;
+
+create table jacarrd_total_m_count
+row format serde "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"
+stored as rcfile
+as
+select a.* , b.count as total_movie_count 
+from jacarrd_movie_count_c2 a join (select customer_id, count(distinct mid) over (partition by 1 ) as total_count from netflix_movie_all ) b
+on (a.mid = b.mid)
+
+drop table if exists jacarrd_m_values;
+
+create table jacarrd_m_values
+row format serde "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"
+stored as rcfile
+as
+ select a.*, a.total_movie_count_c2 - a.m11 as m01,a.total_movie_count_c1 - a.m11 as m10 from jacarrd_movie_count_c2 a;
+
+drop table if exists jacarrd_output_values;
+
+create table jacarrd_output_values
+row format serde "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"
+stored as rcfile
+as
+select a.*, a.m11/(a.m10 + a.m01 + a.m11)  as Jaccard_similarity_coefficient ,(a.m01 + a.m10)/(a.m10 + a.m01 + a.m11) as jaccard_distance
+from jacarrd_m_values a;
+
+INSERT OVERWRITE LOCAL DIRECTORY '/home/hduser/tmp'                                                                       
+ROW FORMAT DELIMITED                                                                                                 
+FIELDS TERMINATED BY ','
+select * from jacarrd_output_values where cust_c1 <> cust_c2 order by Jaccard_similarity_coefficient desc;
+
+select distinct a.cust_c1,a.cust_c2,a.mid_c2 ,b.Jaccard_similarity_coefficient , b.jaccard_distance
+from  jacarrd_init0 a 
+join 
+(select * from jacarrd_output_values where cust_c1 <> cust_c2 order by Jaccard_similarity_coefficient desc limit 5) b 
+on (a.cust_c2 = b.cust_c2 ) 
+order by Jaccard_similarity_coefficient desc
+
+create table final_output_rec_movies
+row format serde "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"
+stored as rcfile
+as
+select distinct c.cust_c1,b.cust_c2,a.mid as mid_c2 ,b.Jaccard_similarity_coefficient , b.jaccard_distance
+from  netflix_movie_all a 
+join 
+(select * from jacarrd_output_values where cust_c1 <> cust_c2 order by Jaccard_similarity_coefficient desc limit 5) b 
+on (a.customer_id = b.cust_c2 ) 
+join jacarrd_init0 c
+on (b.cust_c1 = c.cust_c1)
+where a.rating > 3
+and a.mid <> c.mid
+order by Jaccard_similarity_coefficient desc;
+
+INSERT OVERWRITE LOCAL DIRECTORY '/home/hduser/tmp'                                                                       
+ROW FORMAT DELIMITED                                                                                                 
+FIELDS TERMINATED BY ','
+select distinct c.cust_c1,b.cust_c2,a.mid as mid_c2 ,b.Jaccard_similarity_coefficient , b.jaccard_distance
+from  netflix_movie_all a 
+join 
+(select * from jacarrd_output_values where cust_c1 <> cust_c2 order by Jaccard_similarity_coefficient desc limit 5) b 
+on (a.customer_id = b.cust_c2 ) 
+join jacarrd_init0 c
+on (b.cust_c1 = c.cust_c1)
+where a.rating > 3
+and a.mid <> c.mid
+order by Jaccard_similarity_coefficient desc;
+
+--------------------------------------------------------------------------
+select rating , count(distinct title), count(1)                  
+ from netflix_movie_all                         
+ group by rating                                
+ limit 5;
+------------------------------------------------------------------------------
+ select rating ,title, count(distinct title), count(1) 
+ from netflix_movie_all                                
+ group by rating , title
+ limit 5; 
+
+
+hive> INSERT OVERWRITE LOCAL DIRECTORY '/home/hduser/netflix'
+    > ROW FORMAT DELIMITED 
+    > FIELDS TERMINATED BY ','
+    > select title, rating ,count(1) from netflix_movie_all group by title, rating;
+
+--------------------------------------------------------------------------------------
+INSERT OVERWRITE LOCAL DIRECTORY '/home/hduser/tmp'
+    > ROW FORMAT DELIMITED 
+    > FIELDS TERMINATED BY ','
+    > select customer_id, rating ,count(1) from netflix_movie_all group by customer_id, rating;
+
+----------------------------------------------------------------------------------------
+
+select * from netflix_movie_all a join netflix_movie_all b on (a.mid = b.mid ) where a.customer_id <> b.customer_id limit 20;
+
+hive> select * from 
+    > netflix_movie_all a join netflix_movie_all b 
+    > on (a.mid = b.mid )
+    > where a.customer_id <> b.customer_id 
+    > limit 20;
+
+
+select a.customer_id,b.customer_id,a.mid,a.title,sum(power((customer_id - mid),2)) from 
+    > netflix_movie_all a join netflix_movie_all b 
+    > on (a.mid = b.mid )
+    > where a.customer_id <> b.customer_id 
+    > group by a.customer_id,b.customer_id,a.mid,a.title
+    > limit 20;
+
+
+create table netflix_user_euclidian_similarity
+ROW FORMAT SERDE "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"
+    STORED AS RCFile
+    AS
+select a.customer_id,b.customer_id,a.mid,a.title,power((1+sqrt(sum(power((a.rating - b.rating),2)))),-1) AS 'ED_SCORE' from 
+    > netflix_movie_all a join netflix_movie_all b 
+    > on (a.mid = b.mid )
+    > where a.customer_id <> b.customer_id 
+    > group by a.customer_id,b.customer_id,a.mid,a.title
+
+
+INSERT OVERWRITE LOCAL DIRECTORY '/home/hduser/tmp'
+    > ROW FORMAT DELIMITED 
+    > FIELDS TERMINATED BY ','
+select a.customer_id as C1,b.customer_id as C2,a.mid,a.title,power((1+sqrt(sum(power((a.rating - b.rating),2)))),-1) AS ED_SCORE from 
+    > netflix_movie_all a join netflix_movie_all b 
+    > on (a.mid = b.mid )
+    > where a.customer_id <> b.customer_id 
+    > group by a.customer_id,b.customer_id,a.mid,a.title
+
+hive> INSERT OVERWRITE LOCAL DIRECTORY '/home/hduser/tmp'                         
+    > ROW FORMAT DELIMITED                                                        
+    > FIELDS TERMINATED BY ','                                                    
+    > select date,rating, count(1) from movie_ratings group by date,rating; 
+
+INSERT OVERWRITE LOCAL DIRECTORY '/home/hduser/tmp'                         
+ROW FORMAT DELIMITED                                                        
+FIELDS TERMINATED BY ','                                                    
+select split(date,'-')[1],rating, count(1) from movie_ratings group by split(date,'-')[1],rating; 
+
+
+hive> INSERT OVERWRITE LOCAL DIRECTORY '/home/hduser/tmp'
+    > ROW FORMAT DELIMITED 
+    > FIELDS TERMINATED BY ','
+    > select split(date,'-')[1], count(1) from movie_ratings
+    > group by split(date,'-')[1];
+
+create table movie_user_ratings
+ROW FORMAT SERDE "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"
+    STORED AS RCFile
+    AS
+select a.customer_id as A_CUST_ID,a.rating as A_RATING,b.customer_id as B_CUST_ID,b.rating as B_RATING,a.mid from 
+movie_ratings a join movie_ratings b 
+on (a.mid = b.mid )
+
+INSERT OVERWRITE LOCAL DIRECTORY '/home/hduser/tmp'
+     ROW FORMAT DELIMITED 
+    FIELDS TERMINATED BY ','
+select b.customer_id as C2,a.mid,power((1+sqrt(sum(power((a.rating - b.rating),2)))),-1) AS ED_SCORE from 
+    movie_ratings a join movie_ratings b 
+    on (a.mid = b.mid )
+    where a.customer_id = 1049259 
+    group by a.customer_id,b.customer_id,a.mid
+
+hive> select b.customer_id as C2,power((1+sqrt(sum(power((a.rating - b.rating),2)))),-1) AS ED_SCORE from       
+    >     movie_ratings a join movie_ratings b                                                                  
+    >     on (a.mid = b.mid )                                                                             
+    >     where a.customer_id = 1049259                                                                   
+    >     group by b.customer_id   
+
+
+hive> INSERT OVERWRITE LOCAL DIRECTORY '/home/hduser/tmp'                                                       
+    >      ROW FORMAT DELIMITED                                                                                 
+    >     FIELDS TERMINATED BY ','                                                                              
+    > select b.customer_id as C2,power((1+sqrt(sum(power((a.rating - b.rating),2)))),-1) AS ED_SCORE from       
+    >     movie_ratings a join movie_ratings b                                                            
+    >     on (a.mid = b.mid )                                                                             
+    >     where a.customer_id = 1049259                                                                   
+    >     group by b.customer_id   
+
+
+hive> create table movie_per_year                                                                                      
+    > ROW FORMAT SERDE "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"                          
+    >  STORED AS RCFile                                                                                
+    >     AS                                                                                           
+    > select yearofrelease , count(distinct mid) from movie_titles group by yearofrelease;  
+
+
+hive> create table total_rating_per_movie                                                 
+    > ROW FORMAT SERDE "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"             
+    >  STORED AS RCFile                                                                   
+    >     AS                                                                              
+    > select mid , count(distinct customer_id) AS TOTAL_RATING , avg(rating) as AVG_RATING from movie_ratings group by mid;
+
+ INSERT OVERWRITE LOCAL DIRECTORY '/home/hduser/tmp'                                                                       
+      ROW FORMAT DELIMITED                                                                                                 
+     FIELDS TERMINATED BY ','                                                                                              
+ select a.*,b.title,b.yearofrelease from total_rating_per_movie a join movie_titles b on (a.mid = b.mid )order by avg_rating DESC limit 500;
+
+
+ create table euclidian_similarity
+     ROW FORMAT SERDE "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"
+      STORED AS RCFile
+     AS
+     select b.customer_id as C2,power((1+sqrt(sum(power((a.rating - b.rating),2)))),-1) AS ED_SCORE from
+      movie_ratings a join movie_ratings b
+     on (a.mid = b.mid )
+     where a.customer_id = 1049259
+     group by b.customer_id;
+
+    create table euclidian_similarity2
+     ROW FORMAT SERDE "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"
+      STORED AS RCFile
+     AS
+     select a.customer_id as C1 ,a.yearofrelease as y1 , a.date as d1,a.rating as r1, b.*,power((1+sqrt(sum(power((a.rating - b.rating),2)))),-1) AS ED_SCORE from
+      netflix_movie_all  a join netflix_movie_all b
+     on (a.mid = b.mid )
+customer_id in 	(6,33,42,87,126,168,177,183,189,192)
+     group by b.customer_id;
+
+
+ create table euclidian_similarity2 
+      ROW FORMAT SERDE "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe" 
+     STORED AS RCFile
+     as
+     select a.customer_id as C1 ,b.customer_id ,power((1+sqrt(sum(power((a.rating - b.rating),2)))),-1) AS ED_SCORE from
+     netflix_movie_all  a join netflix_movie_all b
+     on (a.mid = b.mid ) 
+     where a.customer_id in ('6','33','42','87','126','168','177','183','189','192')
+     group by a.customer_id,b.customer_id;
+
+
+ INSERT OVERWRITE LOCAL DIRECTORY '/home/hduser/tmp'                                                                       
+      ROW FORMAT DELIMITED                                                                                                 
+     FIELDS TERMINATED BY ','
+select * from euclidian_similarity2;
+
+
+
+INSERT OVERWRITE LOCAL DIRECTORY '/home/hduser/tmp'
+     ROW FORMAT DELIMITED 
+    FIELDS TERMINATED BY ','
+select b.customer_id as C2,a.mid,power((1+sqrt(sum(power((a.rating - b.rating),2)))),-1) AS ED_SCORE from 
+    movie_ratings a join movie_ratings b 
+    on (a.mid = b.mid )
+    where a.customer_id = 1049259 
+    group by a.customer_id,b.customer_id,a.mid
+
+hive> select b.customer_id as C2,power((1+sqrt(sum(power((a.rating - b.rating),2)))),-1) AS ED_SCORE from       
+    >     movie_ratings a join movie_ratings b                                                                  
+    >     on (a.mid = b.mid )                                                                             
+    >     where a.customer_id = 1049259                                                                   
+    >     group by b.customer_id   
+
+
+hive> INSERT OVERWRITE LOCAL DIRECTORY '/home/hduser/tmp'                                                       
+    >      ROW FORMAT DELIMITED                                                                                 
+    >     FIELDS TERMINATED BY ','                                                                              
+    > select b.customer_id as C2,power((1+sqrt(sum(power((a.rating - b.rating),2)))),-1) AS ED_SCORE from       
+    >     movie_ratings a join movie_ratings b                                                            
+    >     on (a.mid = b.mid )                                                                             
+    >     where a.customer_id = 1049259                                                                   
+    >     group by b.customer_id   
+
+create table movie_rated_by_customer
+ROW FORMAT SERDE "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"
+    STORED AS RCFile
+    AS
+select customer_id , count(distinct mid) as movie_count from movie_ratings
+group by customer_id;
+
+
+create table tmp_sim1
+ROW FORMAT SERDE "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"
+    STORED AS RCFile
+    AS
+select b.* ,a.customer_id as sim_cust_id, a.ed_score from euclidian_similarity2 a join movie_rated_by_customer b
+on (a.c1 = b.customer_id)
+where b.customer_id in ('6','33','42','87','126','168','177','183','189','192')
+
+create table tmp_sim2
+ROW FORMAT SERDE "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"
+    STORED AS RCFile
+    AS
+select a.customer_id,a.movie_count as movie_count_c1,a.sim_cust_id,b.movie_count as sim_movie_count_c2, a.ed_score from tmp_sim1 a join movie_rated_by_customer b
+on (a.sim_cust_id = b.customer_id)
+where b.customer_id <> a.customer_id
+
+ INSERT OVERWRITE LOCAL DIRECTORY '/home/hduser/tmp'                                                                       
+      ROW FORMAT DELIMITED                                                                                                 
+     FIELDS TERMINATED BY ','
+select * from tmp_sim2;
+
+create table movie_ratings_aggregate
+row format serde "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"
+stored as rcfile
+as
+select mid ,title, rating , count(1) as count_rating from netflix_movie_all 
+group by mid ,title, rating
+
+
+create table movie_wighted_average
+row format serde "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"
+stored as rcfile
+as
+select mid, title , (sum(rating*count_rating))/(sum(count_rating)) as wa_rating from movie_ratings_aggregate group by mid, title 
+
+INSERT OVERWRITE LOCAL DIRECTORY '/home/hduser/tmp'                                                                       
+      ROW FORMAT DELIMITED                                                                                                 
+     FIELDS TERMINATED BY ','
+select b.*, b.yearofrelease - b.yearofrelease%10 as decade ,a.wa_rating from movie_wighted_average a join movie_titles b on (a.mid = b.mid ) 
+
+create table movie_decade_ratings
+row format serde "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"
+stored as rcfile
+as
+select b.*, b.yearofrelease - b.yearofrelease%10 as decade ,a.wa_rating from movie_wighted_average a join movie_titles b on (a.mid = b.mid ) 
+
+INSERT OVERWRITE LOCAL DIRECTORY '/home/hduser/tmp'                                                                       
+ROW FORMAT DELIMITED                                                                                                 
+FIELDS TERMINATED BY ','
+SELECT S.title,S.yearofrelease, S.decade, S.wa_rating
+FROM
+(SELECT title,yearofrelease, decade, wa_rating, row_number() over (partition by decade) as r FROM movie_decade_ratings order by wa_rating desc) S
+WHERE S.r < 11
+
+
+create table j_movie_decade_ratings
+row format serde "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe"
+stored as rcfile
+as
+select b.*, b.yearofrelease - b.yearofrelease%10 as decade ,a.wa_rating from movie_wighted_average a join movie_titles b on (a.mid = b.mid ) 
